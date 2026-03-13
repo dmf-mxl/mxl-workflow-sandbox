@@ -5,7 +5,7 @@ name: Link Requirement Issue
 
 on:
   issues:
-    types: [opened, edited]
+    types: [opened] # Option A: do not listen to 'edited' to avoid the extra skipped run
 
 permissions:
   contents: read
@@ -14,24 +14,17 @@ permissions:
 
 jobs:
   link-requirement:
-    # Only run for Issue Type = Feature AND never on self-edits by the App/bots
+    # Only run for Issue Type = Feature (handles both string and object forms)
     if: >
-      (
-        github.event.issue.type == 'Feature' ||
-        github.event.issue.type.name == 'Feature'
-      )
-      &&
-      !(
-        github.event.action == 'edited' &&
-        (
-          contains(github.actor, '[bot]') ||
-          contains(github.event.sender.login, 'cross-repo-issue-access')
-        )
-      )
+      github.event.issue.type == 'Feature' ||
+      github.event.issue.type.name == 'Feature'
 
     runs-on: ubuntu-latest
 
+    # Opt into Node 24 now to silence the Node 20 deprecation banner
+    # (remove once upstream actions publish Node 24 builds)
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Per GitHub changelog guidance [1](https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/)
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_BODY: ${{ github.event.issue.body }}
       DEFAULT_REQUIREMENTS_REPO: ${{ vars.DEFAULT_REQUIREMENTS_REPO || 'dmf-mxl/mxl-requirements' }}
@@ -153,7 +146,7 @@ jobs:
           PARENT_NODE=$(gh issue view "$PARENT_URL" --json id --jq .id)
           CHILD_NODE=$(gh issue view "$CHILD_URL"  --json id --jq .id)
 
-          # ---- Idempotency check (needs sub_issues feature header) ----
+          # Idempotency check (needs sub_issues feature header)
           set +e
           EXISTING_CHILD_IDS=$(
             gh api graphql \
@@ -173,7 +166,7 @@ jobs:
           set -e
 
           if [ $QUERY_RC -ne 0 ]; then
-            echo "WARN: Could not read existing sub-issues (query rc=$QUERY_RC). Will attempt to add link."
+            echo "WARN: Could not read existing sub-issues (rc=$QUERY_RC). Will attempt to add link."
           else
             if echo "$EXISTING_CHILD_IDS" | grep -Fxq "$CHILD_NODE"; then
               echo "Sub-issue relation already exists; skipping link."
@@ -181,7 +174,7 @@ jobs:
             fi
           fi
 
-          # ---- Create the link (tolerate 'already exists' gracefully) ----
+          # Create the link (tolerate 'already linked')
           set +e
           gh api graphql \
             -H "GraphQL-Features: sub_issues" \
@@ -206,9 +199,11 @@ jobs:
           fi
 
       ###########################################################################
-      # (5) Append clickable requirement URL to bottom of body (idempotent)
+      # (5) Remove the visible 'Requirement Link' section and append the URL
+      #     - Strip the heading and the first non-empty line after it (e.g., '144')
+      #     - Append the normalized clickable URL in a marker block at the bottom
       ###########################################################################
-      - name: Append requirement URL to issue body (no-op safe)
+      - name: Clean body (remove user-entered link) and append URL
         if: ${{ steps.normalize.outputs.issue_num != '' }}
         shell: bash
         env:
@@ -220,9 +215,27 @@ jobs:
 
           gh api "repos/$CHILD_REPO/issues/$CHILD_NUMBER" --jq .body > body_current.txt || echo -n > body_current.txt
 
-          # Create a candidate new body by replacing the marker block
-          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_current.txt > body_clean.txt
+          # Remove the '### Requirement Link' heading + the next non-empty line (the user's raw value)
+          awk '
+            BEGIN { drop=0; consumed=0 }
+            function isblank(s){ return (s ~ /^[[:space:]]*$/) }
+            {
+              if (drop==0 && tolower($0) ~ /^###[[:space:]]*requirement[[:space:]]*link[[:space:]]*$/) {
+                drop=1; consumed=0; next
+              }
+              if (drop==1) {
+                if (!isblank($0)) { consumed=consumed+1 }
+                if (consumed>=1) { drop=0; next }
+                else { next }
+              }
+              print
+            }
+          ' body_current.txt > body_stripped.txt
 
+          # Remove previous marker block if present
+          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_stripped.txt > body_clean.txt
+
+          # Append the normalized URL in a marker block
           {
             echo
             echo "<!--mxl:requirement:start-->"
@@ -230,7 +243,7 @@ jobs:
             echo "<!--mxl:requirement:end-->"
           } >> body_clean.txt
 
-          # Only PATCH if the body actually changes (avoids unnecessary edited events)
+          # Only PATCH if the body actually changes (avoids extra edited events)
           if cmp -s body_current.txt body_clean.txt; then
             echo "No body changes; skipping PATCH."
             exit 0
