@@ -267,16 +267,18 @@ jobs:
           fi
 
       ###########################################################################
-      # (6) Clean body and write a single hidden marker block you specified:
-      #     <!--mxl:linksection:start-->### Link Requirement
-      #     - <normalized URL>
-      #     <!--mxl:linksection:end-->
+      # (6) Clean body and append:
+      #     ### Link Requirement
+      #     - [owner/repo#num: title](URL)
       ###########################################################################
-      - name: Update issue body (hidden one-line marker only)
+      - name: Update issue body (one-line hyperlink with number + title)
         if: ${{ steps.normalize.outputs.issue_num != '' }}
         shell: bash
         env:
           REQUIRE_URL: ${{ steps.normalize.outputs.requirement_url }}
+          REQUIRE_TITLE: ${{ steps.parent_meta.outputs.title }}
+          OWNER_REPO: ${{ steps.normalize.outputs.owner_repo }}
+          ISSUE_NUM: ${{ steps.normalize.outputs.issue_num }}
           CHILD_REPO: ${{ github.repository }}
           CHILD_NUMBER: ${{ env.ISSUE_NUMBER }}
         run: |
@@ -284,7 +286,7 @@ jobs:
 
           gh api "repos/$CHILD_REPO/issues/$CHILD_NUMBER" --jq .body > body_current.txt || echo -n > body_current.txt
 
-          # 1) Remove the visible "### Requirement Link" + next non-empty line (user’s raw value)
+          # 1) Remove the visible "### Requirement Link" + next non-empty line (user’s raw input)
           awk '
             BEGIN { drop=0; consumed=0 }
             function isblank(s){ return (s ~ /^[[:space:]]*$/) }
@@ -300,19 +302,33 @@ jobs:
             }
           ' body_current.txt > body_stripped.txt
 
-          # 2) Remove any previous blocks we own
+          # 2) Remove any previous blocks we own (idempotent)
           sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_stripped.txt > body_clean1.txt
           sed -e '/<!--mxl:linksection:start-->/,/<!--mxl:linksection:end-->/d' body_clean1.txt > body_clean.txt
 
-          # 3) Append your exact hidden block (no visible text at all)
+          # 3) Make the title single-line for safety
+          ONE_LINE_TITLE=$(printf "%s" "$REQUIRE_TITLE" | tr '\r\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^[[:space:]]\+//; s/[[:space:]]\+$//')
+
+          # 4) Build the single-line hyperlink text: owner/repo#num: title
+          LINK_TEXT="$OWNER_REPO#$ISSUE_NUM"
+          if [ -n "$ONE_LINE_TITLE" ]; then
+            LINK_TEXT="$LINK_TEXT: $ONE_LINE_TITLE"
+          fi
+
+          # 5) Append the new visible section + (optional) hidden marker block for idempotency
           {
             echo
-            echo "<!--mxl:linksection:start-->### Link Requirement"
-            echo "- $REQUIRE_URL"
+            echo "<!--mxl:linksection:start-->"
+            echo "### Link Requirement"
+            echo "- [$LINK_TEXT]($REQUIRE_URL)"
             echo "<!--mxl:linksection:end-->"
+            echo
+            echo "<!--mxl:requirement:start-->"
+            echo "$REQUIRE_URL"
+            echo "<!--mxl:requirement:end-->"
           } >> body_clean.txt
 
-          # 4) Only PATCH if the body actually changed
+          # 6) Only PATCH if the body actually changed
           if cmp -s body_current.txt body_clean.txt; then
             echo "No body changes; skipping PATCH."
             exit 0
