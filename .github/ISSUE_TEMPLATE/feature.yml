@@ -25,11 +25,5 @@ body:
     validations:
       required: true
 
-  # Hidden machine-readable metadata for Actions
-  - type: markdown
-    attributes:
-      value: |
-        <!-- mxl:requirement_link=${{ form.requirement_link }} -->
-
 # SPDX-FileCopyrightText: 2025 Contributors to the Media eXchange Layer project.
 # SPDX-License-Identifier: Apache-2.0

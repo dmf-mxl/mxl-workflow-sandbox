@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   link-requirement:
-    # Only run for Issue Type = Feature
+    # Only run for Issue Type = Feature (covers both string and object forms)
     if: >
       github.event.issue.type == 'Feature' ||
       github.event.issue.type.name == 'Feature'
@@ -25,49 +25,72 @@ jobs:
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_BODY: ${{ github.event.issue.body }}
       DEFAULT_REQUIREMENTS_REPO: ${{ vars.DEFAULT_REQUIREMENTS_REPO || 'dmf-mxl/mxl-requirements' }}
+      # If you want to use a PAT in this repo, uncomment the next line and ensure the secret exists:
+      # GH_TOKEN: ${{ secrets.CROSS_OWNER_LINKING_PAT }}
 
     steps:
       ###########################################################################
-      # 0) TOKEN (your choice: PAT or GitHub App)
+      # 0) If you prefer the org GitHub App token here instead of PAT, uncomment:
       ###########################################################################
-      # Option A: PAT (simple for sandbox)
+      - name: Create GitHub App token (org)
+        id: app_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.CROSS_REPO_ISSUE_ACCESS_APP_ID }}
+          private-key: ${{ secrets.CROSS_REPO_ISSUE_ACCESS_PRIVATE_KEY }}
+          owner: dmf-mxl
       - name: Export GH_TOKEN
-        run: echo "GH_TOKEN=${{ secrets.CROSS_OWNER_LINKING_PAT }}" >> "$GITHUB_ENV"
-
-      # Option B: GitHub App (uncomment this in main repo)
-      # - uses: actions/create-github-app-token@v2
-      #   id: app
-      #   with:
-      #     app-id: ${{ vars.CROSS_REPO_ISSUE_ACCESS_APP_ID }}
-      #     private-key: ${{ secrets.CROSS_REPO_ISSUE_ACCESS_PRIVATE_KEY }}
-      #     owner: dmf-mxl
-      # - run: echo "GH_TOKEN=${{ steps.app.outputs.token }}" >> "$GITHUB_ENV"
+        run: echo "GH_TOKEN=${{ steps.app_token.outputs.token }}" >> "$GITHUB_ENV"
 
       ###########################################################################
-      # 1) Extract requirement_link from hidden HTML comment
+      # 1) Show a visible snippet of the body (so we see exactly what we parse)
+      ###########################################################################
+      - name: DEBUG — show body snippet
+        run: |
+          echo "First 300 chars of issue body:"
+          echo "------------------------------------"
+          printf "%s" "$ISSUE_BODY" | head -c 300
+          echo
+          echo "------------------------------------"
+
+      ###########################################################################
+      # 2) Extract requirement_link:
+      #    - find '### Requirement Link' (case/space-tolerant)
+      #    - skip blank lines
+      #    - take the first non-empty line as the value
       ###########################################################################
       - name: Extract requirement_link
         id: extract_raw
+        shell: bash
         run: |
-          # Extract line like: <!-- mxl:requirement_link=VALUE -->
-          REQ=$(printf "%s\n" "$ISSUE_BODY" \
-            | sed -n 's/.*<!-- mxl:requirement_link=\(.*\) -->.*/\1/p')
+          # Normalize line endings and collapse hard-to-see characters
+          CLEAN=$(printf "%s\n" "$ISSUE_BODY" | sed 's/\r//g')
 
-          echo "requirement_link=$REQ" >> "$GITHUB_OUTPUT"
-          echo "Extracted: $REQ"
+          # Stateful awk:
+          #   - once we hit the heading, start reading subsequent lines
+          #   - skip blank lines
+          #   - the first non-blank line is the value
+          REQ_LINE=$(printf "%s\n" "$CLEAN" | awk '
+            BEGIN { seen=0 }
+            tolower($0) ~ /^###[[:space:]]*requirement[[:space:]]*link[[:space:]]*$/ { seen=1; next }
+            seen && $0 ~ /[^[:space:]]/ { print; exit }
+          ' | xargs)
+
+          echo "Extracted requirement_link: '$REQ_LINE'"
+          echo "requirement_link=$REQ_LINE" >> "$GITHUB_OUTPUT"
 
       - name: Guard requirement_link
         id: guard
         run: |
           if [ -z "${{ steps.extract_raw.outputs.requirement_link }}" ]; then
-            echo "Requirement link missing — skipping workflow"
+            echo "Requirement Link missing — skipping workflow"
             echo "has=false" >> "$GITHUB_OUTPUT"
           else
             echo "has=true" >> "$GITHUB_OUTPUT"
           fi
 
       ###########################################################################
-      # 2) NORMALIZE requirement_link
+      # 3) Normalize requirement_link → owner_repo, issue_num, requirement_url
       ###########################################################################
       - name: Normalize requirement link
         if: ${{ steps.guard.outputs.has == 'true' }}
@@ -76,6 +99,7 @@ jobs:
           RAW_LINK: ${{ steps.extract_raw.outputs.requirement_link }}
           DEFAULT: ${{ env.DEFAULT_REQUIREMENTS_REPO }}
         run: |
+          set -euo pipefail
           LINK=$(echo "$RAW_LINK" | xargs)
           OWNER_REPO=""
           ISSUE_NUM=""
@@ -90,18 +114,19 @@ jobs:
             OWNER_REPO="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
             ISSUE_NUM="${BASH_REMATCH[3]}"
           else
-            echo "ERROR: Cannot parse '$LINK'"
+            echo "ERROR: Cannot parse requirement reference '$LINK'"
             exit 1
           fi
 
           REQUIRE_URL="https://github.com/${OWNER_REPO}/issues/${ISSUE_NUM}"
 
-          echo "owner_repo=$OWNER_REPO"      >> "$GITHUB_OUTPUT"
-          echo "issue_num=$ISSUE_NUM"       >> "$GITHUB_OUTPUT"
+          echo "Normalized → $REQUIRE_URL"
+          echo "owner_repo=$OWNER_REPO"       >> "$GITHUB_OUTPUT"
+          echo "issue_num=$ISSUE_NUM"        >> "$GITHUB_OUTPUT"
           echo "requirement_url=$REQUIRE_URL" >> "$GITHUB_OUTPUT"
 
       ###########################################################################
-      # 3) Create parent → child sub‑issue link
+      # 4) Parent → child sub-issue link
       ###########################################################################
       - name: Link as sub-issue
         if: ${{ steps.normalize.outputs.issue_num != '' }}
@@ -112,7 +137,7 @@ jobs:
           CHILD_NUMBER: ${{ env.ISSUE_NUMBER }}
         run: |
           set -euo pipefail
-
+          echo "Linking Feature #$CHILD_NUMBER → Requirement $PARENT_REPO#$PARENT_NUMBER"
           PARENT_NODE=$(gh issue view "$PARENT_REPO#$PARENT_NUMBER" --json id --jq .id)
           CHILD_NODE=$(gh issue view "$CHILD_REPO#$CHILD_NUMBER" --json id --jq .id)
 
@@ -131,7 +156,7 @@ jobs:
             "
 
       ###########################################################################
-      # 4) Append clickable requirement URL to end of issue body
+      # 5) Append clickable requirement URL to bottom of issue body (idempotent)
       ###########################################################################
       - name: Append requirement URL to issue body
         if: ${{ steps.normalize.outputs.issue_num != '' }}
@@ -141,20 +166,19 @@ jobs:
           CHILD_NUMBER: ${{ env.ISSUE_NUMBER }}
         run: |
           set -euo pipefail
-
-          gh api "repos/$CHILD_REPO/issues/$CHILD_NUMBER" --jq .body > body_current.txt
-
-          # Clear old marker
-          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' \
-            body_current.txt > body_clean.txt
-
-          printf "\n\n<!--mxl:requirement:start-->\n%s\n<!--mxl:requirement:end-->\n" \
-            "$REQUIRE_URL" >> body_clean.txt
-
-          NEW_BODY=$(cat body_clean.txt)
+          gh api "repos/$CHILD_REPO/issues/$CHILD_NUMBER" --jq .body > body_current.txt || echo -n > body_current.txt
+          # Remove old marker (if present)
+          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_current.txt > body_clean.txt
+          # Append new marker block
+          {
+            echo ""
+            echo "<!--mxl:requirement:start-->"
+            echo "$REQUIRE_URL"
+            echo "<!--mxl:requirement:end-->"
+          } >> body_clean.txt
 
           gh api \
             --method PATCH \
             -H "Accept: application/vnd.github+json" \
             "repos/$CHILD_REPO/issues/$CHILD_NUMBER" \
-            -f body="$NEW_BODY"
+            -f body="$(cat body_clean.txt)"
