@@ -3,9 +3,15 @@
 
 name: Link Requirement Issue
 
+# Force JavaScript actions (e.g., actions/create-github-app-token) to run on Node 24 now.
+# This removes the Node 20 deprecation warning and future-proofs the workflow
+# per GitHub’s guidance. You can remove this once all used actions ship Node 24 builds.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # See GitHub changelog. [1](https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/)
+
 on:
   issues:
-    types: [opened] # Option A: do not listen to 'edited' to avoid the extra skipped run
+    types: [opened] # Option A: only "opened" → avoids the extra (skipped) run on bot edits
 
 permissions:
   contents: read
@@ -14,17 +20,14 @@ permissions:
 
 jobs:
   link-requirement:
-    # Only run for Issue Type = Feature (handles both string and object forms)
+    # Only run for Issue Type = Feature (string or object form)
     if: >
       github.event.issue.type == 'Feature' ||
       github.event.issue.type.name == 'Feature'
 
     runs-on: ubuntu-latest
 
-    # Opt into Node 24 now to silence the Node 20 deprecation banner
-    # (remove once upstream actions publish Node 24 builds)
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Per GitHub changelog guidance [1](https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/)
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_BODY: ${{ github.event.issue.body }}
       DEFAULT_REQUIREMENTS_REPO: ${{ vars.DEFAULT_REQUIREMENTS_REPO || 'dmf-mxl/mxl-requirements' }}
@@ -40,12 +43,12 @@ jobs:
           app-id: ${{ vars.CROSS_REPO_ISSUE_ACCESS_APP_ID }}
           private-key: ${{ secrets.CROSS_REPO_ISSUE_ACCESS_PRIVATE_KEY }}
           owner: dmf-mxl
-
       - name: Export GH_TOKEN from GitHub App
         run: echo "GH_TOKEN=${{ steps.app_token.outputs.token }}" >> "$GITHUB_ENV"
+        # Note: keep an eye on action updates that announce native Node 24 support. [2](https://github.com/actions/create-github-app-token)
 
       ###########################################################################
-      # (1) Show a snippet so we can verify what we’re parsing
+      # (1) DEBUG: show a small snippet so we see what we’re parsing
       ###########################################################################
       - name: DEBUG — show body snippet
         shell: bash
@@ -65,6 +68,8 @@ jobs:
         run: |
           CLEAN=$(printf "%s\n" "$ISSUE_BODY" | sed 's/\r//g')
 
+          # Find a line that is exactly the '### Requirement Link' heading (case/space tolerant),
+          # then skip blank lines, and take the first non-empty line as the value.
           REQ_LINE=$(printf "%s\n" "$CLEAN" | awk '
             BEGIN { seen=0 }
             tolower($0) ~ /^###[[:space:]]*requirement[[:space:]]*link[[:space:]]*$/ { seen=1; next }
@@ -124,7 +129,24 @@ jobs:
           echo "requirement_url=$REQUIRE_URL" >> "$GITHUB_OUTPUT"
 
       ###########################################################################
-      # (4) Parent → child sub-issue link (idempotent; full URLs; feature header)
+      # (4) Fetch requirement title (for display under “Link Requirement”)
+      ###########################################################################
+      - name: Fetch requirement title
+        if: ${{ steps.normalize.outputs.issue_num != '' }}
+        id: parent_meta
+        shell: bash
+        env:
+          PARENT_REPO: ${{ steps.normalize.outputs.owner_repo }}
+          PARENT_NUMBER: ${{ steps.normalize.outputs.issue_num }}
+        run: |
+          set -euo pipefail
+          PARENT_URL="https://github.com/$PARENT_REPO/issues/$PARENT_NUMBER"
+          # Use gh issue view to read the title
+          TITLE=$(gh issue view "$PARENT_URL" --json title --jq .title)
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+      ###########################################################################
+      # (5) Parent → child sub-issue link (idempotent; full URLs; sub_issues header)
       ###########################################################################
       - name: Link as sub-issue (idempotent)
         if: ${{ steps.normalize.outputs.issue_num != '' }}
@@ -136,7 +158,6 @@ jobs:
           CHILD_NUMBER: ${{ env.ISSUE_NUMBER }}
         run: |
           set -euo pipefail
-
           PARENT_URL="https://github.com/$PARENT_REPO/issues/$PARENT_NUMBER"
           CHILD_URL="https://github.com/$CHILD_REPO/issues/$CHILD_NUMBER"
 
@@ -146,7 +167,7 @@ jobs:
           PARENT_NODE=$(gh issue view "$PARENT_URL" --json id --jq .id)
           CHILD_NODE=$(gh issue view "$CHILD_URL"  --json id --jq .id)
 
-          # Idempotency check (needs sub_issues feature header)
+          # Idempotency: read current sub-issues
           set +e
           EXISTING_CHILD_IDS=$(
             gh api graphql \
@@ -174,7 +195,7 @@ jobs:
             fi
           fi
 
-          # Create the link (tolerate 'already linked')
+          # Try to create the relation (tolerate 'already linked')
           set +e
           gh api graphql \
             -H "GraphQL-Features: sub_issues" \
@@ -199,15 +220,16 @@ jobs:
           fi
 
       ###########################################################################
-      # (5) Remove the visible 'Requirement Link' section and append the URL
-      #     - Strip the heading and the first non-empty line after it (e.g., '144')
-      #     - Append the normalized clickable URL in a marker block at the bottom
+      # (6) Clean body (remove the user's raw link), then append a visible section:
+      #     "### Link Requirement" with the *title* hyperlinked to the normalized URL.
+      #     We also keep a hidden marker block with just the URL for idempotent updates.
       ###########################################################################
-      - name: Clean body (remove user-entered link) and append URL
+      - name: Update issue body (remove raw link, add titled link section)
         if: ${{ steps.normalize.outputs.issue_num != '' }}
         shell: bash
         env:
           REQUIRE_URL: ${{ steps.normalize.outputs.requirement_url }}
+          REQUIRE_TITLE: ${{ steps.parent_meta.outputs.title }}
           CHILD_REPO: ${{ github.repository }}
           CHILD_NUMBER: ${{ env.ISSUE_NUMBER }}
         run: |
@@ -215,7 +237,7 @@ jobs:
 
           gh api "repos/$CHILD_REPO/issues/$CHILD_NUMBER" --jq .body > body_current.txt || echo -n > body_current.txt
 
-          # Remove the '### Requirement Link' heading + the next non-empty line (the user's raw value)
+          # 1) Remove "### Requirement Link" heading and the next non-empty line (user's raw value)
           awk '
             BEGIN { drop=0; consumed=0 }
             function isblank(s){ return (s ~ /^[[:space:]]*$/) }
@@ -232,19 +254,31 @@ jobs:
             }
           ' body_current.txt > body_stripped.txt
 
-          # Remove previous marker block if present
+          # 2) Remove any previous marker/titled section we own
           sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_stripped.txt > body_clean.txt
+          sed -e '/<!--mxl:linksection:start-->/,/<!--mxl:linksection:end-->/d' body_clean.txt > body_base.txt
 
-          # Append the normalized URL in a marker block
+          # 3) Append visible titled section + invisible marker block
           {
+            echo
+            echo "<!--mxl:linksection:start-->"
+            echo "### Link Requirement"
+            if [ -n "$REQUIRE_TITLE" ]; then
+              # Title + URL
+              echo "- [$REQUIRE_TITLE]($REQUIRE_URL)"
+            else
+              # Fallback to just the URL if title could not be read
+              echo "- $REQUIRE_URL"
+            fi
+            echo "<!--mxl:linksection:end-->"
             echo
             echo "<!--mxl:requirement:start-->"
             echo "$REQUIRE_URL"
             echo "<!--mxl:requirement:end-->"
-          } >> body_clean.txt
+          } >> body_base.txt
 
-          # Only PATCH if the body actually changes (avoids extra edited events)
-          if cmp -s body_current.txt body_clean.txt; then
+          # 4) Only PATCH if something actually changed (avoids spurious edited events)
+          if cmp -s body_current.txt body_base.txt; then
             echo "No body changes; skipping PATCH."
             exit 0
           fi
@@ -254,4 +288,4 @@ jobs:
             --method PATCH \
             -H "Accept: application/vnd.github+json" \
             "repos/$CHILD_REPO/issues/$CHILD_NUMBER" \
-            -f body="$(cat body_clean.txt)"
+            -f body="$(cat body_base.txt)"
