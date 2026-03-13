@@ -267,11 +267,13 @@ jobs:
           fi
 
       ###########################################################################
-      # (6) Clean body and append:
+      # (6) Clean body and append exactly:
       #     ### Link Requirement
-      #     - [owner/repo#num: title](URL)
+      #     [owner/repo#num: title](URL)
+      #   - No bullet
+      #   - No hidden URL marker (prevents duplicate lower link)
       ###########################################################################
-      - name: Update issue body (one-line hyperlink with number + title)
+      - name: Update issue body (single hyperlink, no bullet)
         if: ${{ steps.normalize.outputs.issue_num != '' }}
         shell: bash
         env:
@@ -303,32 +305,28 @@ jobs:
           ' body_current.txt > body_stripped.txt
 
           # 2) Remove any previous blocks we own (idempotent)
-          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_stripped.txt > body_clean1.txt
-          sed -e '/<!--mxl:linksection:start-->/,/<!--mxl:linksection:end-->/d' body_clean1.txt > body_clean.txt
+          #    - Old visible section
+          sed -e '/<!--mxl:linksection:start-->/,/<!--mxl:linksection:end-->/d' body_stripped.txt > body_clean.txt
+          #    - Old hidden URL marker (remove to avoid the lower link)
+          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' -i body_clean.txt
 
-          # 3) Make the title single-line for safety
+          # 3) Make the title single-line and build the combined hyperlink text
           ONE_LINE_TITLE=$(printf "%s" "$REQUIRE_TITLE" | tr '\r\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^[[:space:]]\+//; s/[[:space:]]\+$//')
-
-          # 4) Build the single-line hyperlink text: owner/repo#num: title
           LINK_TEXT="$OWNER_REPO#$ISSUE_NUM"
           if [ -n "$ONE_LINE_TITLE" ]; then
             LINK_TEXT="$LINK_TEXT: $ONE_LINE_TITLE"
           fi
 
-          # 5) Append the new visible section + (optional) hidden marker block for idempotency
+          # 4) Append the visible heading + one-line hyperlink (no bullet, no extra link below)
           {
             echo
             echo "<!--mxl:linksection:start-->"
             echo "### Link Requirement"
-            echo "- [$LINK_TEXT]($REQUIRE_URL)"
+            echo "[$LINK_TEXT]($REQUIRE_URL)"
             echo "<!--mxl:linksection:end-->"
-            echo
-            echo "<!--mxl:requirement:start-->"
-            echo "$REQUIRE_URL"
-            echo "<!--mxl:requirement:end-->"
           } >> body_clean.txt
 
-          # 6) Only PATCH if the body actually changed
+          # 5) Only PATCH if the body actually changed
           if cmp -s body_current.txt body_clean.txt; then
             echo "No body changes; skipping PATCH."
             exit 0
