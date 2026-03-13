@@ -3,15 +3,9 @@
 
 name: Link Requirement Issue
 
-# Force JavaScript actions (e.g., actions/create-github-app-token) to run on Node 24 now.
-# This removes the Node 20 deprecation warning and future-proofs the workflow
-# per GitHub’s guidance. You can remove this once all used actions ship Node 24 builds.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # See GitHub changelog. [1](https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/)
-
 on:
   issues:
-    types: [opened] # Option A: only "opened" → avoids the extra (skipped) run on bot edits
+    types: [opened] # opened-only → no extra (skipped) run from the bot’s body edit
 
 permissions:
   contents: read
@@ -31,21 +25,77 @@ jobs:
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_BODY: ${{ github.event.issue.body }}
       DEFAULT_REQUIREMENTS_REPO: ${{ vars.DEFAULT_REQUIREMENTS_REPO || 'dmf-mxl/mxl-requirements' }}
+      APP_ID: ${{ vars.CROSS_REPO_ISSUE_ACCESS_APP_ID }} # GitHub App ID
+      APP_PRIVATE_KEY: ${{ secrets.CROSS_REPO_ISSUE_ACCESS_PRIVATE_KEY }} # PEM (multi-line)
+      ORG_LOGIN: dmf-mxl # installation owner to target
 
     steps:
       ###########################################################################
-      # (0) Use GitHub App token (org) — ACTIVE
+      # (0) Create GitHub App installation token — pure Bash (no Node action)
+      #     Follows GitHub’s docs: create a JWT, list installations, exchange
+      #     for installation token. [1](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app)
       ###########################################################################
-      - name: Create GitHub App token (org)
+      - name: Create GitHub App token (Bash)
         id: app_token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.CROSS_REPO_ISSUE_ACCESS_APP_ID }}
-          private-key: ${{ secrets.CROSS_REPO_ISSUE_ACCESS_PRIVATE_KEY }}
-          owner: dmf-mxl
-      - name: Export GH_TOKEN from GitHub App
-        run: echo "GH_TOKEN=${{ steps.app_token.outputs.token }}" >> "$GITHUB_ENV"
-        # Note: keep an eye on action updates that announce native Node 24 support. [2](https://github.com/actions/create-github-app-token)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # --- Write the PEM private key to disk securely ---
+          umask 077
+          echo "$APP_PRIVATE_KEY" > app_private_key.pem
+
+          # --- Build JWT (header.payload.signature) ---
+          now=$(date +%s)
+          iat=$((now - 60))            # allow 60s clock skew
+          exp=$((now + 540))           # 9 minutes (max 10m)
+
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+          header='{"alg":"RS256","typ":"JWT"}'
+          payload=$(jq -nc --arg iat "$iat" --arg exp "$exp" --arg appid "$APP_ID" \
+                   '{iat:($iat|tonumber), exp:($exp|tonumber), iss:($appid|tonumber)}')
+
+          header_b64=$(printf '%s' "$header" | b64url)
+          payload_b64=$(printf '%s' "$payload" | b64url)
+          signing_input="${header_b64}.${payload_b64}"
+
+          signature=$(printf '%s' "$signing_input" \
+            | openssl dgst -sha256 -sign app_private_key.pem -binary \
+            | b64url)
+
+          jwt="${signing_input}.${signature}"
+
+          # --- Find installation for the org owner ---
+          installations=$(curl -fsSL -H "Authorization: Bearer $jwt" \
+                                   -H "Accept: application/vnd.github+json" \
+                                   https://api.github.com/app/installations)
+
+          inst_id=$(echo "$installations" \
+            | jq -r --arg owner "$ORG_LOGIN" '.[] | select(.account.login==$owner) | .id' | head -n1)
+
+          if [ -z "${inst_id:-}" ]; then
+            echo "ERROR: No installation found for owner '$ORG_LOGIN'." >&2
+            exit 1
+          fi
+
+          # --- Exchange for an installation access token ---
+          token_json=$(curl -fsSL -X POST \
+            -H "Authorization: Bearer $jwt" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/$inst_id/access_tokens")
+
+          gh_token=$(echo "$token_json" | jq -r .token)
+
+          if [ -z "${gh_token:-}" ] || [ "$gh_token" = "null" ]; then
+            echo "ERROR: Could not obtain installation token." >&2
+            echo "$token_json" >&2
+            exit 1
+          fi
+
+          echo "GH_TOKEN=$gh_token" >> "$GITHUB_ENV"
+          # Optionally expose minimal metadata via outputs
+          echo "installation-id=$inst_id" >> "$GITHUB_OUTPUT"
 
       ###########################################################################
       # (1) DEBUG: show a small snippet so we see what we’re parsing
@@ -68,8 +118,6 @@ jobs:
         run: |
           CLEAN=$(printf "%s\n" "$ISSUE_BODY" | sed 's/\r//g')
 
-          # Find a line that is exactly the '### Requirement Link' heading (case/space tolerant),
-          # then skip blank lines, and take the first non-empty line as the value.
           REQ_LINE=$(printf "%s\n" "$CLEAN" | awk '
             BEGIN { seen=0 }
             tolower($0) ~ /^###[[:space:]]*requirement[[:space:]]*link[[:space:]]*$/ { seen=1; next }
@@ -129,7 +177,7 @@ jobs:
           echo "requirement_url=$REQUIRE_URL" >> "$GITHUB_OUTPUT"
 
       ###########################################################################
-      # (4) Fetch requirement title (for display under “Link Requirement”)
+      # (4) Fetch requirement title (for the one-line display after the URL)
       ###########################################################################
       - name: Fetch requirement title
         if: ${{ steps.normalize.outputs.issue_num != '' }}
@@ -141,12 +189,11 @@ jobs:
         run: |
           set -euo pipefail
           PARENT_URL="https://github.com/$PARENT_REPO/issues/$PARENT_NUMBER"
-          # Use gh issue view to read the title
           TITLE=$(gh issue view "$PARENT_URL" --json title --jq .title)
           echo "title=$TITLE" >> "$GITHUB_OUTPUT"
 
       ###########################################################################
-      # (5) Parent → child sub-issue link (idempotent; full URLs; sub_issues header)
+      # (5) Parent → child sub-issue link (idempotent; full URLs)
       ###########################################################################
       - name: Link as sub-issue (idempotent)
         if: ${{ steps.normalize.outputs.issue_num != '' }}
@@ -195,7 +242,7 @@ jobs:
             fi
           fi
 
-          # Try to create the relation (tolerate 'already linked')
+          # Create the relation (tolerate 'already linked')
           set +e
           gh api graphql \
             -H "GraphQL-Features: sub_issues" \
@@ -220,11 +267,11 @@ jobs:
           fi
 
       ###########################################################################
-      # (6) Clean body (remove the user's raw link), then append a visible section:
-      #     "### Link Requirement" with the *title* hyperlinked to the normalized URL.
-      #     We also keep a hidden marker block with just the URL for idempotent updates.
+      # (6) Clean body and append exactly:
+      #     **Link Requirement**
+      #     * <requirement URL>: <requirement title>
       ###########################################################################
-      - name: Update issue body (remove raw link, add titled link section)
+      - name: Update issue body (remove raw link, add titled one-liner)
         if: ${{ steps.normalize.outputs.issue_num != '' }}
         shell: bash
         env:
@@ -237,7 +284,7 @@ jobs:
 
           gh api "repos/$CHILD_REPO/issues/$CHILD_NUMBER" --jq .body > body_current.txt || echo -n > body_current.txt
 
-          # 1) Remove "### Requirement Link" heading and the next non-empty line (user's raw value)
+          # 1) Remove the visible "### Requirement Link" + next non-empty line
           awk '
             BEGIN { drop=0; consumed=0 }
             function isblank(s){ return (s ~ /^[[:space:]]*$/) }
@@ -254,20 +301,19 @@ jobs:
             }
           ' body_current.txt > body_stripped.txt
 
-          # 2) Remove any previous marker/titled section we own
-          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_stripped.txt > body_clean.txt
-          sed -e '/<!--mxl:linksection:start-->/,/<!--mxl:linksection:end-->/d' body_clean.txt > body_base.txt
+          # 2) Remove previous sections/markers we own
+          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_stripped.txt > body_clean1.txt
+          sed -e '/<!--mxl:linksection:start-->/,/<!--mxl:linksection:end-->/d' body_clean1.txt > body_clean.txt
 
-          # 3) Append visible titled section + invisible marker block
+          # 3) Append formatted display + hidden marker (idempotent)
           {
             echo
             echo "<!--mxl:linksection:start-->"
             echo "### Link Requirement"
             if [ -n "$REQUIRE_TITLE" ]; then
-              # Title + URL
-              echo "- [$REQUIRE_TITLE]($REQUIRE_URL)"
+              # URL followed by colon + plain title (no hyperlink), same line
+              echo "- $REQUIRE_URL: $REQUIRE_TITLE"
             else
-              # Fallback to just the URL if title could not be read
               echo "- $REQUIRE_URL"
             fi
             echo "<!--mxl:linksection:end-->"
@@ -275,10 +321,10 @@ jobs:
             echo "<!--mxl:requirement:start-->"
             echo "$REQUIRE_URL"
             echo "<!--mxl:requirement:end-->"
-          } >> body_base.txt
+          } >> body_clean.txt
 
-          # 4) Only PATCH if something actually changed (avoids spurious edited events)
-          if cmp -s body_current.txt body_base.txt; then
+          # 4) Only PATCH if the body actually changes
+          if cmp -s body_current.txt body_clean.txt; then
             echo "No body changes; skipping PATCH."
             exit 0
           fi
@@ -288,4 +334,4 @@ jobs:
             --method PATCH \
             -H "Accept: application/vnd.github+json" \
             "repos/$CHILD_REPO/issues/$CHILD_NUMBER" \
-            -f body="$(cat body_base.txt)"
+            -f body="$(cat body_clean.txt)"
