@@ -267,16 +267,16 @@ jobs:
           fi
 
       ###########################################################################
-      # (6) Clean body and append exactly:
-      #     ### Link Requirement
-      #     - <requirement URL>: <requirement title>
+      # (6) Clean body and write a single hidden marker block you specified:
+      #     <!--mxl:linksection:start-->### Link Requirement
+      #     - <normalized URL>
+      #     <!--mxl:linksection:end-->
       ###########################################################################
-      - name: Update issue body (remove raw link, add one-line titled link)
+      - name: Update issue body (hidden one-line marker only)
         if: ${{ steps.normalize.outputs.issue_num != '' }}
         shell: bash
         env:
           REQUIRE_URL: ${{ steps.normalize.outputs.requirement_url }}
-          REQUIRE_TITLE: ${{ steps.parent_meta.outputs.title }}
           CHILD_REPO: ${{ github.repository }}
           CHILD_NUMBER: ${{ env.ISSUE_NUMBER }}
         run: |
@@ -284,7 +284,7 @@ jobs:
 
           gh api "repos/$CHILD_REPO/issues/$CHILD_NUMBER" --jq .body > body_current.txt || echo -n > body_current.txt
 
-          # 1) Remove the visible "### Requirement Link" + next non-empty line (user's raw input)
+          # 1) Remove the visible "### Requirement Link" + next non-empty line (user’s raw value)
           awk '
             BEGIN { drop=0; consumed=0 }
             function isblank(s){ return (s ~ /^[[:space:]]*$/) }
@@ -300,31 +300,19 @@ jobs:
             }
           ' body_current.txt > body_stripped.txt
 
-          # 2) Remove any previous blocks we own (idempotent)
+          # 2) Remove any previous blocks we own
           sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_stripped.txt > body_clean1.txt
           sed -e '/<!--mxl:linksection:start-->/,/<!--mxl:linksection:end-->/d' body_clean1.txt > body_clean.txt
 
-          # 3) Sanitize the title to be single-line (avoid surprises)
-          ONE_LINE_TITLE=$(printf "%s" "$REQUIRE_TITLE" | tr '\r\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//')
-
-          # 4) Append the new visible section + hidden marker (for future updates)
+          # 3) Append your exact hidden block (no visible text at all)
           {
             echo
-            echo "<!--mxl:linksection:start-->"
-            echo "### Link Requirement"
-            if [ -n "$ONE_LINE_TITLE" ]; then
-              echo "- $REQUIRE_URL: $ONE_LINE_TITLE"
-            else
-              echo "- $REQUIRE_URL"
-            fi
+            echo "<!--mxl:linksection:start-->### Link Requirement"
+            echo "- $REQUIRE_URL"
             echo "<!--mxl:linksection:end-->"
-            echo
-            echo "<!--mxl:requirement:start-->"
-            echo "$REQUIRE_URL"
-            echo "<!--mxl:requirement:end-->"
           } >> body_clean.txt
 
-          # 5) Only PATCH if the body actually changes (avoids extra edited events)
+          # 4) Only PATCH if the body actually changed
           if cmp -s body_current.txt body_clean.txt; then
             echo "No body changes; skipping PATCH."
             exit 0
