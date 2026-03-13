@@ -131,7 +131,7 @@ jobs:
           echo "requirement_url=$REQUIRE_URL" >> "$GITHUB_OUTPUT"
 
       ###########################################################################
-      # (4) Parent → child sub-issue link (use full URLs; idempotent)
+      # (4) Parent → child sub-issue link (idempotent; full URLs; feature header)
       ###########################################################################
       - name: Link as sub-issue (idempotent)
         if: ${{ steps.normalize.outputs.issue_num != '' }}
@@ -143,3 +143,102 @@ jobs:
           CHILD_NUMBER: ${{ env.ISSUE_NUMBER }}
         run: |
           set -euo pipefail
+
+          PARENT_URL="https://github.com/$PARENT_REPO/issues/$PARENT_NUMBER"
+          CHILD_URL="https://github.com/$CHILD_REPO/issues/$CHILD_NUMBER"
+
+          echo "Parent:  $PARENT_URL"
+          echo "Child:   $CHILD_URL"
+
+          PARENT_NODE=$(gh issue view "$PARENT_URL" --json id --jq .id)
+          CHILD_NODE=$(gh issue view "$CHILD_URL"  --json id --jq .id)
+
+          # ---- Idempotency check (needs sub_issues feature header) ----
+          set +e
+          EXISTING_CHILD_IDS=$(
+            gh api graphql \
+              -H "GraphQL-Features: sub_issues" \
+              -f query='
+                query($id:ID!) {
+                  node(id:$id) {
+                    ... on Issue {
+                      subIssues(first:100) { nodes { id } }
+                    }
+                  }
+                }' \
+              -f id="$PARENT_NODE" \
+              --jq '.data.node.subIssues.nodes[].id' 2>/dev/null
+          )
+          QUERY_RC=$?
+          set -e
+
+          if [ $QUERY_RC -ne 0 ]; then
+            echo "WARN: Could not read existing sub-issues (query rc=$QUERY_RC). Will attempt to add link."
+          else
+            if echo "$EXISTING_CHILD_IDS" | grep -Fxq "$CHILD_NODE"; then
+              echo "Sub-issue relation already exists; skipping link."
+              exit 0
+            fi
+          fi
+
+          # ---- Create the link (tolerate 'already exists' gracefully) ----
+          set +e
+          gh api graphql \
+            -H "GraphQL-Features: sub_issues" \
+            -f query="
+              mutation {
+                addSubIssue(input: {
+                  issueId: \"${PARENT_NODE}\",
+                  subIssueId: \"${CHILD_NODE}\"
+                }) {
+                  issue { url }
+                  subIssue { url }
+                }
+              }
+            "
+          MUT_RC=$?
+          set -e
+
+          if [ $MUT_RC -ne 0 ]; then
+            echo "WARN: addSubIssue returned rc=$MUT_RC (possibly already linked). Continuing."
+          else
+            echo "Sub-issue relation created."
+          fi
+
+      ###########################################################################
+      # (5) Append clickable requirement URL to bottom of body (idempotent)
+      ###########################################################################
+      - name: Append requirement URL to issue body (no-op safe)
+        if: ${{ steps.normalize.outputs.issue_num != '' }}
+        shell: bash
+        env:
+          REQUIRE_URL: ${{ steps.normalize.outputs.requirement_url }}
+          CHILD_REPO: ${{ github.repository }}
+          CHILD_NUMBER: ${{ env.ISSUE_NUMBER }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/$CHILD_REPO/issues/$CHILD_NUMBER" --jq .body > body_current.txt || echo -n > body_current.txt
+
+          # Create a candidate new body by replacing the marker block
+          sed -e '/<!--mxl:requirement:start-->/,/<!--mxl:requirement:end-->/d' body_current.txt > body_clean.txt
+
+          {
+            echo
+            echo "<!--mxl:requirement:start-->"
+            echo "$REQUIRE_URL"
+            echo "<!--mxl:requirement:end-->"
+          } >> body_clean.txt
+
+          # Only PATCH if the body actually changes (avoids unnecessary edited events)
+          if cmp -s body_current.txt body_clean.txt; then
+            echo "No body changes; skipping PATCH."
+            exit 0
+          fi
+
+          echo "Patching body…"
+          gh api \
+            --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$CHILD_REPO/issues/$CHILD_NUMBER" \
+            -f body="$(cat body_clean.txt)"
